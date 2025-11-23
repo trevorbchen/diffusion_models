@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.learnpytorch.io)",
+      "Bash(move \"C:\\Users\\Trevo\\OneDrive\\Desktop\\AI_studies\\data_setup.py\" \"C:\\Users\\Trevo\\OneDrive\\Desktop\\AI_studies\\src\"\" && move \"C:UsersTrevoOneDriveDesktopAI_studiesmodel_builder.py\" \"C:UsersTrevoOneDriveDesktopAI_studiessrc\"\")",
+      "Bash(move \"C:\\Users\\Trevo\\OneDrive\\Desktop\\AI_studies\\engine.py\" \"C:\\Users\\Trevo\\OneDrive\\Desktop\\AI_studies\\src\"\" && move \"C:UsersTrevoOneDriveDesktopAI_studiesutils.py\" \"C:UsersTrevoOneDriveDesktopAI_studiessrc\"\")",
+      "Bash(move:*)",
+      "Bash(python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
