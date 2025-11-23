@@ -166,8 +166,11 @@ class DSM:
             alpha_bar_t = torch.tensor(self.scheduler.alphas_cumprod[t], device=self.device)
             sigma_t = torch.sqrt(1 - alpha_bar_t)
 
-            # Step size: Use constant step size for Langevin dynamics
-            eta = torch.tensor(0.05, device=self.device)
+            # Annealed step size: η_t ∝ σ_t^2
+            # At high noise levels (early), take larger steps
+            # At low noise levels (late), take smaller steps
+            base_epsilon = 0.8  # Larger base step size for more aggressive denoising
+            eta = base_epsilon * (sigma_t ** 2)
 
             # Langevin dynamics: x_{n+1} = x_n + η·s_φ(x_n; σ) + √(2η)·ε_n
             x = x + eta * predicted_score
@@ -177,8 +180,7 @@ class DSM:
                 z = torch.randn_like(x)
                 x = x + torch.sqrt(2 * eta) * z
 
-            # Clip to reasonable range
-            x = torch.clamp(x, -1.5, 1.5)
+            # No clipping during intermediate steps - let Langevin dynamics explore freely
 
         # Final clipping to valid range
         x = torch.clamp(x, -1, 1)
@@ -322,6 +324,9 @@ def train_dsm(
             train_losses.append(loss)
             progress_bar.set_postfix({'dsm_loss': f'{loss:.4f}'})
 
+            # Step the learning rate scheduler after each batch
+            lr_scheduler.step()
+
         avg_train_loss = sum(train_losses) / len(train_losses)
 
         # Testing
@@ -348,7 +353,9 @@ def train_dsm(
         metrics = evaluator.evaluate(generated_samples, num_nn_samples=100)
 
         # Log metrics
+        current_lr = lr_scheduler.get_last_lr()[0]
         print(f"\nEpoch {epoch + 1} Results:")
+        print(f"  Learning Rate: {current_lr:.6f}")
         print(f"  Train DSM Loss: {avg_train_loss:.4f}")
         print(f"  Test DSM Loss: {avg_test_loss:.4f}")
         print(f"  Mean NN Distance: {metrics['mean_nn_distance']:.4f}")
@@ -356,6 +363,7 @@ def train_dsm(
 
         wandb.log({
             'epoch': epoch + 1,
+            'learning_rate': current_lr,
             'train_dsm_loss': avg_train_loss,
             'test_dsm_loss': avg_test_loss,
             'mean_nn_distance': metrics['mean_nn_distance'],

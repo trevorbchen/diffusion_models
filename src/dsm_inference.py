@@ -91,19 +91,21 @@ def dsm_sample(model, scheduler, num_samples=4, num_steps=None, device='cuda', s
         # The model output IS the score (gradient), use it directly
         score = model_output
 
-        # Step size for Langevin dynamics (try larger value)
-        epsilon = torch.tensor(0.05, device=device)
+        # Annealed step size: η_t ∝ σ_t^2
+        # At high noise levels (early), take larger steps
+        # At low noise levels (late), take smaller steps
+        base_epsilon = 0.8  # Larger base step size for more aggressive denoising
+        epsilon_t = base_epsilon * (sigma_t ** 2)
 
-        # Langevin update: x = x + epsilon * score + sqrt(2 * epsilon) * noise
-        x = x + epsilon * score
+        # Langevin update with properly scaled step
+        x = x + epsilon_t * score
 
         if t > 0:
             # Add noise for stochastic sampling (except at last step)
             z = torch.randn_like(x)
-            x = x + torch.sqrt(2 * epsilon) * z
+            x = x + torch.sqrt(2 * epsilon_t) * z
 
-        # Clip to reasonable range during sampling
-        x = torch.clamp(x, -1.5, 1.5)
+        # No clipping during intermediate steps - let Langevin dynamics explore freely
 
     # Final clipping to valid range
     x = torch.clamp(x, -1, 1)
