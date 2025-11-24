@@ -1,12 +1,15 @@
 """
 DSM (Denoising Score Matching) EBM training script.
 
-Unlike DDPM which predicts noise, DSM trains an energy-based model to estimate
-the score function (gradient of log-likelihood) using denoising score matching.
+True DSM uses a SINGLE FIXED noise level σ, not a schedule.
 
-The key difference is the loss function:
-- DDPM: MSE loss between predicted noise and actual noise
-- DSM: Denoising score matching loss that trains the model to estimate gradients
+Training:
+- Add noise: x̃ = x + σε where ε ~ N(0, I)
+- Train model to predict score: ∇_x log p_σ(x)
+- Loss: E[||score + ε/σ||²]
+
+Sampling:
+- Use Langevin dynamics at the single noise level
 """
 import torch
 import torch.nn as nn
@@ -18,21 +21,18 @@ import os
 from pathlib import Path
 
 from unet import UNet
-from dataset import create_dataloader
-from variance_scheduler import VarianceScheduler
+from dsm_scheduler import DSMScheduler
 from evaluation import DiffusionEvaluator
+from torchvision import datasets, transforms
 
 
 class DSM:
     """
-    Denoising Score Matching EBM for image generation.
-
-    The model learns to estimate the score function (gradient of log p(x))
-    through denoising score matching instead of predicting noise directly.
+    Denoising Score Matching with single fixed noise level.
 
     Args:
         model: UNet model (predicts score/gradient)
-        scheduler: Variance scheduler
+        scheduler: DSMScheduler with fixed sigma
         device: Device to use
     """
 
@@ -40,45 +40,33 @@ class DSM:
         self.model = model.to(device)
         self.scheduler = scheduler
         self.device = device
+        self.sigma = scheduler.sigma
 
-    def dsm_loss(self, noise, timesteps, predicted_score):
+    def dsm_loss(self, noise, predicted_score):
         """
-        Denoising Score Matching loss (simplified version).
+        True DSM loss with single fixed noise level σ.
 
-        Formulation: L_DSM = E[||σ·s_φ(x_t; σ) + ϵ||²]
+        Formulation (from eq 3.3.4):
+            L_DSM(φ; σ) = (1/2) E[||s_φ(x̃; σ) + ε/σ||²]
 
         where:
-        - x_t = x + σϵ (noisy data)
-        - s_φ is the predicted score
-        - σ is the noise level at timestep t
-        - ϵ is the added noise
+        - x̃ = x + σε (noisy data)
+        - s_φ is the predicted score ∇_x log p_σ(x)
+        - σ is the FIXED noise level
+        - ε ~ N(0, I) is the added noise
 
-        This formulation is stable across different noise levels.
+        The optimal score satisfies: s_φ(x̃; σ) = -ε/σ
 
         Args:
             noise: Added noise ϵ ~ N(0, I)
-            timesteps: Timestep indices
-            predicted_score: Model's predicted score s_φ(x_t; σ)
+            predicted_score: Model's predicted score s_φ(x̃; σ)
 
         Returns:
-            DSM loss value
+            DSM loss value (without 1/2 factor, doesn't affect optimization)
         """
-        # Get noise levels (sigma_t) for each timestep
-        # sigma_t^2 = 1 - alpha_bar_t (variance of noise at time t)
-        batch_size = noise.shape[0]
-
-        # Extract sigma values for the batch
-        sigmas = []
-        for t in timesteps:
-            alpha_bar_t = self.scheduler.alphas_cumprod[t.item()]
-            sigma_t = torch.sqrt(torch.tensor(1 - alpha_bar_t, device=self.device))
-            sigmas.append(sigma_t)
-
-        sigma_batch = torch.stack(sigmas).view(batch_size, 1, 1, 1)
-
-        # Simple DSM loss: E[||σ·score + ε||²]
-        # No division by σ²
-        loss = torch.mean((predicted_score * sigma_batch + noise) ** 2)
+        # DSM loss: MSE(predicted_score, -ε/σ) = E[||s_φ(x̃; σ) + ε/σ||²]
+        target = -noise / self.sigma
+        loss = nn.functional.mse_loss(predicted_score, target)
 
         return loss
 
@@ -87,7 +75,7 @@ class DSM:
         Single training step with DSM loss.
 
         Args:
-            batch: Dictionary with 'noisy_image', 'timestep', 'noise', 'original'
+            batch: Clean image tensor (batch_size, C, H, W)
             optimizer: Optimizer
 
         Returns:
@@ -96,21 +84,21 @@ class DSM:
         self.model.train()
         optimizer.zero_grad()
 
-        # Get data
-        noisy_images = batch['noisy_image'].to(self.device)
-        timesteps = batch['timestep'].to(self.device)
-        noise = batch['noise'].to(self.device)
+        # Get clean images (simple tensor from DSM dataloader)
+        clean_images = batch.to(self.device)
 
-        # Add small input noise for stability, especially at early timesteps
-        # This prevents numerical issues when sigma is very small
-        input_noise_scale = 0.05
-        noisy_images = noisy_images + input_noise_scale * torch.randn_like(noisy_images)
+        # Add noise: x̃ = x + σε
+        noisy_images, noise = self.scheduler.add_noise(clean_images)
+
+        # DSM doesn't use timesteps - pass a dummy timestep (all zeros)
+        batch_size = clean_images.shape[0]
+        dummy_timestep = torch.zeros(batch_size, dtype=torch.long, device=self.device)
 
         # Predict score (model output represents the score function)
-        predicted_score = self.model(noisy_images, timesteps)
+        predicted_score = self.model(noisy_images, dummy_timestep)
 
         # Compute DSM loss
-        loss = self.dsm_loss(noise, timesteps, predicted_score)
+        loss = self.dsm_loss(noise, predicted_score)
 
         # Backward pass
         loss.backward()
@@ -123,64 +111,46 @@ class DSM:
         return loss.item()
 
     @torch.no_grad()
-    def sample(self, num_samples, image_size=(1, 28, 28), num_steps=None):
+    def sample(self, num_samples, image_size=(1, 28, 28), num_steps=1000, eta=0.1):
         """
-        Generate samples using Langevin dynamics.
+        Generate samples using Langevin dynamics at single noise level.
 
-        For score-based models, we use annealed Langevin dynamics:
-        x_{t-1} = x_t + epsilon_t * s_theta(x_t, t) + sqrt(2 * epsilon_t) * z
+        For DSM with fixed σ, we use simple Langevin dynamics:
+        x_{k+1} = x_k + η·∇_x log p_σ(x_k) + √(2η)·z
 
-        where s_theta is the predicted score and z ~ N(0, I)
+        where z ~ N(0, I)
 
         Args:
             num_samples: Number of samples to generate
             image_size: Size of images (C, H, W)
-            num_steps: Number of sampling steps (if None, uses all timesteps)
+            num_steps: Number of Langevin steps (more steps = better quality)
+            eta: Step size for Langevin dynamics
 
         Returns:
             Generated images tensor (num_samples, C, H, W)
         """
         self.model.eval()
 
-        # Start from pure noise
-        x = torch.randn(num_samples, *image_size).to(self.device)
+        # Start from data corrupted with noise at level σ
+        x = torch.randn(num_samples, *image_size).to(self.device) * self.sigma
 
-        # Create timestep sequence
-        total_timesteps = self.scheduler.num_timesteps
-        if num_steps is None:
-            timesteps = list(range(total_timesteps))[::-1]
-        else:
-            step_size = total_timesteps // num_steps
-            timesteps = list(range(0, total_timesteps, step_size))[::-1]
-            if timesteps[-1] != 0:
-                timesteps.append(0)
+        # Dummy timestep (DSM doesn't use timesteps)
+        dummy_timestep = torch.zeros(num_samples, dtype=torch.long, device=self.device)
 
-        # Annealed Langevin dynamics
-        for i, t in enumerate(tqdm(timesteps, desc="Sampling (Langevin)")):
-            t_batch = torch.full((num_samples,), t, dtype=torch.long, device=self.device)
+        # Convert eta to tensor
+        eta_tensor = torch.tensor(eta, device=self.device)
 
-            # Predict score s_φ(x_n; σ)
-            predicted_score = self.model(x, t_batch)
+        # Langevin dynamics
+        for step in tqdm(range(num_steps), desc="Langevin Sampling"):
+            # Predict score ∇_x log p_σ(x)
+            predicted_score = self.model(x, dummy_timestep)
 
-            # Get noise level σ_t from the same scheduler used in training
-            alpha_bar_t = torch.tensor(self.scheduler.alphas_cumprod[t], device=self.device)
-            sigma_t = torch.sqrt(1 - alpha_bar_t)
+            # Langevin update: x_{k+1} = x_k + η·score + √(2η)·z
+            x = x + eta_tensor * predicted_score
 
-            # Annealed step size: η_t ∝ σ_t^2
-            # At high noise levels (early), take larger steps
-            # At low noise levels (late), take smaller steps
-            base_epsilon = 0.8  # Larger base step size for more aggressive denoising
-            eta = base_epsilon * (sigma_t ** 2)
-
-            # Langevin dynamics: x_{n+1} = x_n + η·s_φ(x_n; σ) + √(2η)·ε_n
-            x = x + eta * predicted_score
-
-            if t > 0:
-                # Add noise: √(2η)·ε_n where ε_n ~ N(0, I)
-                z = torch.randn_like(x)
-                x = x + torch.sqrt(2 * eta) * z
-
-            # No clipping during intermediate steps - let Langevin dynamics explore freely
+            # Add noise for stochastic sampling
+            z = torch.randn_like(x)
+            x = x + torch.sqrt(2 * eta_tensor) * z
 
         # Final clipping to valid range
         x = torch.clamp(x, -1, 1)
@@ -192,21 +162,19 @@ def train_dsm(
     epochs=6,
     batch_size=32,
     learning_rate=3e-4,
-    num_timesteps=500,
-    schedule_type='linear',
+    sigma=0.5,
     device='cuda',
     save_dir='../models',
     wandb_project='dsm-ebm-fashion-mnist'
 ):
     """
-    Train DSM EBM model.
+    Train DSM EBM model with single fixed noise level.
 
     Args:
         epochs: Number of training epochs
         batch_size: Batch size
         learning_rate: Learning rate
-        num_timesteps: Number of diffusion timesteps
-        schedule_type: 'linear' or 'cosine'
+        sigma: Fixed noise level (typically 0.3-0.5 for images in [-1,1])
         device: Device to use
         save_dir: Directory to save models
         wandb_project: Wandb project name
@@ -217,12 +185,11 @@ def train_dsm(
     save_path.mkdir(parents=True, exist_ok=True)
 
     print(f"Using device: {device}")
-    print(f"Training DSM EBM with Denoising Score Matching")
+    print(f"Training DSM with single fixed noise level")
     print(f"Training for {epochs} epochs")
     print(f"Batch size: {batch_size}")
     print(f"Learning rate: {learning_rate}")
-    print(f"Timesteps: {num_timesteps}")
-    print(f"Schedule: {schedule_type}")
+    print(f"Noise level (sigma): {sigma}")
 
     # Initialize wandb (offline mode)
     wandb.init(
@@ -232,25 +199,17 @@ def train_dsm(
             'epochs': epochs,
             'batch_size': batch_size,
             'learning_rate': learning_rate,
-            'num_timesteps': num_timesteps,
-            'schedule_type': schedule_type,
+            'sigma': sigma,
             'architecture': 'UNet',
-            'model_type': 'DSM-EBM',
+            'model_type': 'DSM',
             'loss': 'Denoising Score Matching',
             'model_dim': 64,
             'dim_mults': (1, 2, 4)
         }
     )
 
-    # Create variance scheduler
-    beta_end = 0.35 if num_timesteps <= 100 else 0.02
-
-    scheduler = VarianceScheduler(
-        num_timesteps=num_timesteps,
-        beta_start=1e-4,
-        beta_end=beta_end,
-        schedule_type=schedule_type
-    )
+    # Create DSM scheduler (single fixed noise level)
+    scheduler = DSMScheduler(sigma=sigma)
 
     # Create model (same UNet architecture as DDPM)
     # Fashion MNIST: 1 channel, 28x28
@@ -270,20 +229,20 @@ def train_dsm(
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    # Create dataloaders
-    train_loader = create_dataloader(
+    # Create DSM dataloaders (clean images only, no wasted VP noise computation)
+    from dsm_dataset import create_dsm_dataloader
+
+    train_loader = create_dsm_dataloader(
         split='train',
         batch_size=batch_size,
-        scheduler=scheduler,
         augment=True,
         shuffle=True,
         num_workers=0
     )
 
-    test_loader = create_dataloader(
+    test_loader = create_dsm_dataloader(
         split='test',
         batch_size=batch_size,
-        scheduler=scheduler,
         augment=False,
         shuffle=False,
         num_workers=0
@@ -301,13 +260,9 @@ def train_dsm(
     )
     print(f"LR scheduler: Cosine annealing from {learning_rate} to {learning_rate * 0.01}")
 
-    # Create evaluator
-    print("\nInitializing evaluator...")
-    evaluator = DiffusionEvaluator(train_loader, device=device)
-
     # Training loop
     print("\n" + "="*50)
-    print("Starting DSM EBM training...")
+    print("Starting DSM training...")
     print("="*50 + "\n")
 
     for epoch in range(epochs):
@@ -335,22 +290,20 @@ def train_dsm(
 
         with torch.no_grad():
             for batch in tqdm(test_loader, desc="Testing (DSM)"):
-                noisy_images = batch['noisy_image'].to(device)
-                timesteps = batch['timestep'].to(device)
-                noise = batch['noise'].to(device)
+                clean_images = batch.to(device)
 
-                predicted_score = model(noisy_images, timesteps)
-                loss = dsm.dsm_loss(noise, timesteps, predicted_score)
+                # Add noise with DSM scheduler
+                noisy_images, noise = dsm.scheduler.add_noise(clean_images)
+
+                # Dummy timestep
+                batch_size = clean_images.shape[0]
+                dummy_timestep = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+                predicted_score = model(noisy_images, dummy_timestep)
+                loss = dsm.dsm_loss(noise, predicted_score)
                 test_losses.append(loss.item())
 
         avg_test_loss = sum(test_losses) / len(test_losses)
-
-        # Generate samples for evaluation
-        print("Generating samples for evaluation...")
-        generated_samples = dsm.sample(num_samples=100, image_size=(1, 28, 28))
-
-        # Evaluate
-        metrics = evaluator.evaluate(generated_samples, num_nn_samples=100)
 
         # Log metrics
         current_lr = lr_scheduler.get_last_lr()[0]
@@ -358,40 +311,34 @@ def train_dsm(
         print(f"  Learning Rate: {current_lr:.6f}")
         print(f"  Train DSM Loss: {avg_train_loss:.4f}")
         print(f"  Test DSM Loss: {avg_test_loss:.4f}")
-        print(f"  Mean NN Distance: {metrics['mean_nn_distance']:.4f}")
-        print(f"  Overfit %: {metrics['overfit_percentage']:.2f}%")
 
         wandb.log({
             'epoch': epoch + 1,
             'learning_rate': current_lr,
             'train_dsm_loss': avg_train_loss,
-            'test_dsm_loss': avg_test_loss,
-            'mean_nn_distance': metrics['mean_nn_distance'],
-            'min_nn_distance': metrics['min_nn_distance'],
-            'max_nn_distance': metrics['max_nn_distance'],
-            'overfit_percentage': metrics['overfit_percentage']
+            'test_dsm_loss': avg_test_loss
         })
 
-        # Log sample images
-        sample_grid = generated_samples[:16].cpu()
-        wandb.log({
-            'generated_samples': [wandb.Image(img) for img in sample_grid]
-        })
+        # Generate and log sample images every epoch
+        if (epoch + 1) % 1 == 0:
+            print("Generating samples...")
+            generated_samples = dsm.sample(num_samples=16, image_size=(1, 28, 28), num_steps=500)
+            sample_grid = generated_samples.cpu()
+            wandb.log({
+                'generated_samples': [wandb.Image(img) for img in sample_grid]
+            })
 
     # Save final model
     print("\n" + "="*50)
     print("Training complete! Saving final model...")
     print("="*50)
 
-    final_model_path = save_path / 'dsm_ebm_final.pt'
+    final_model_path = save_path / 'dsm_final.pt'
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_config': {
-            'num_timesteps': num_timesteps,
-            'beta_start': 1e-4,
-            'beta_end': beta_end,
-            'schedule_type': schedule_type
+            'sigma': sigma
         },
         'model_config': {
             'in_channels': 1,
@@ -400,7 +347,7 @@ def train_dsm(
             'dim_mults': (1, 2, 4),
             'dropout': 0.1
         },
-        'model_type': 'DSM-EBM'
+        'model_type': 'DSM'
     }, final_model_path)
 
     print(f"Model saved to: {final_model_path}")
@@ -413,12 +360,11 @@ def train_dsm(
 
 if __name__ == "__main__":
     train_dsm(
-        epochs=3,
-        batch_size=32,
+        epochs=5,
+        batch_size=128,
         learning_rate=1e-3,
-        num_timesteps=50,
-        schedule_type='linear',
+        sigma=0.5,  # Fixed noise level for DSM
         device='cuda' if torch.cuda.is_available() else 'cpu',
         save_dir='../models',
-        wandb_project='dsm-ebm-fashion-mnist'
+        wandb_project='dsm-fashion-mnist'
     )
