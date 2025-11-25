@@ -1,0 +1,21 @@
+2025-11-24 20:33:41,584 INFO    MainThread:40304 [wandb_setup.py:_flush():81] Current SDK version is 0.22.2
+2025-11-24 20:33:41,584 INFO    MainThread:40304 [wandb_setup.py:_flush():81] Configure stats pid to 40304
+2025-11-24 20:33:41,584 INFO    MainThread:40304 [wandb_setup.py:_flush():81] Loading settings from C:\Users\Trevo\.config\wandb\settings
+2025-11-24 20:33:41,585 INFO    MainThread:40304 [wandb_setup.py:_flush():81] Loading settings from C:\Users\Trevo\OneDrive\Desktop\AI_studies\src\wandb\settings
+2025-11-24 20:33:41,585 INFO    MainThread:40304 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2025-11-24 20:33:41,585 INFO    MainThread:40304 [wandb_init.py:setup_run_log_directory():705] Logging user logs to C:\Users\Trevo\OneDrive\Desktop\AI_studies\src\wandb\offline-run-20251124_203341-c0esnfh1\logs\debug.log
+2025-11-24 20:33:41,596 INFO    MainThread:40304 [wandb_init.py:setup_run_log_directory():706] Logging internal logs to C:\Users\Trevo\OneDrive\Desktop\AI_studies\src\wandb\offline-run-20251124_203341-c0esnfh1\logs\debug-internal.log
+2025-11-24 20:33:41,597 INFO    MainThread:40304 [wandb_init.py:init():832] calling init triggers
+2025-11-24 20:33:41,597 INFO    MainThread:40304 [wandb_init.py:init():837] wandb.init called with sweep_config: {}
+config: {'epochs': 5, 'batch_size': 128, 'learning_rate': 0.001, 'num_scales': 10, 'sigma_min': 0.01, 'sigma_max': 1.0, 'schedule_type': 'cosine', 'model_type': 'NCSN', 'architecture': 'UNet', 'model_dim': 64, 'dim_mults': (1, 2, 4), '_wandb': {}}
+2025-11-24 20:33:41,597 INFO    MainThread:40304 [wandb_init.py:init():880] starting backend
+2025-11-24 20:33:43,878 INFO    MainThread:40304 [wandb_init.py:init():883] sending inform_init request
+2025-11-24 20:33:43,996 INFO    MainThread:40304 [wandb_init.py:init():891] backend started and connected
+2025-11-24 20:33:43,999 INFO    MainThread:40304 [wandb_init.py:init():961] updated telemetry
+2025-11-24 20:33:44,090 INFO    MainThread:40304 [wandb_init.py:init():985] communicating run to backend with 90.0 second timeout
+2025-11-24 20:33:44,866 INFO    MainThread:40304 [wandb_init.py:init():1036] starting run threads in backend
+2025-11-24 20:33:56,853 INFO    MainThread:40304 [wandb_run.py:_console_start():2509] atexit reg
+2025-11-24 20:33:56,853 INFO    MainThread:40304 [wandb_run.py:_redirect():2357] redirect: wrap_raw
+2025-11-24 20:33:56,853 INFO    MainThread:40304 [wandb_run.py:_redirect():2426] Wrapping output streams.
+2025-11-24 20:33:56,854 INFO    MainThread:40304 [wandb_run.py:_redirect():2449] Redirects installed.
+2025-11-24 20:33:56,871 INFO    MainThread:40304 [wandb_init.py:init():1076] run started, returning control to user process
