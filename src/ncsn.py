@@ -37,8 +37,8 @@ class NCSN:
         """
         Compute NCSN denoising score matching loss.
 
-        Loss formula (with sigma^2 weighting):
-            L = E[sigma^2 * ||s_theta(x + sigma*epsilon, sigma) + epsilon/sigma||^2]
+        Loss formula (with sigma weighting):
+            L = E[sigma * ||s_theta(x + sigma*epsilon, sigma) + epsilon/sigma||^2]
 
         Args:
             clean_images: Clean images (batch, C, H, W)
@@ -61,8 +61,9 @@ class NCSN:
         # Per-sample loss (MSE)
         loss_per_sample = ((predicted_score - target) ** 2).mean(dim=(1, 2, 3))
 
-        # Weight by sigma^2 to balance gradients across scales
-        # (high sigma has larger scores, low sigma has smaller scores)
+        # Weight by sigma^2 to DOWN-weight small sigma levels
+        # At small sigma, target score = -noise/sigma becomes huge
+        # Weighting by sigma^2 compensates: sigma^2 * (1/sigma^2) = 1
         weights = sigma ** 2
 
         # Weighted mean
@@ -88,7 +89,7 @@ class NCSN:
 
     @torch.no_grad()
     def sample(self, num_samples, image_size=(1, 28, 28),
-               steps_per_level=100, step_size=None, temperature=1.0):
+               steps_per_level=500, step_size=None, temperature=1.0):
         """
         Annealed Langevin dynamics sampling.
 
@@ -99,8 +100,8 @@ class NCSN:
         Args:
             num_samples: Number of samples
             image_size: (C, H, W)
-            steps_per_level: Langevin steps at each noise level
-            step_size: Fixed step size (if None, uses adaptive formula)
+            steps_per_level: Langevin steps at each noise level (500 default)
+            step_size: Step size (if None, uses adaptive sigma^2 scaling)
             temperature: Final noise temperature (1.0 = standard)
 
         Returns:
@@ -116,11 +117,9 @@ class NCSN:
         for level in range(self.scheduler.num_scales):
             sigma = self.scheduler.sigmas[level].item()
 
-            # Step size: use fixed or adaptive
-            # Fixed is more stable than sigma^2 scaling
+            # CRITICAL FIX: Adaptive step size that scales with sigma^2
             if step_size is None:
-                # Simple fixed step size
-                epsilon = 0.00002  # 2e-5, works well in practice
+                epsilon = 0.1 * (sigma ** 2)  # Scale with sigma^2 - much more effective!
             else:
                 epsilon = step_size
 
@@ -133,9 +132,11 @@ class NCSN:
                 score = self.model(x, level_idx)
 
                 # Langevin update
-                # Last step of last level: no noise added
-                if level == self.scheduler.num_scales - 1 and step == steps_per_level - 1:
-                    noise = 0
+                # Last steps of last level: gradually reduce noise
+                if level == self.scheduler.num_scales - 1 and step >= steps_per_level - 10:
+                    # Gradually reduce noise in final 10 steps
+                    noise_scale = (steps_per_level - step) / 10.0
+                    noise = torch.randn_like(x) * temperature * noise_scale
                 else:
                     noise = torch.randn_like(x) * temperature
 
@@ -195,7 +196,7 @@ def train_ncsn(
         sigma_max=sigma_max,
         schedule_type=schedule_type
     )
-    print(f"\nNoise levels (geometric sequence):")
+    print(f"\nNoise levels ({schedule_type} schedule):")
     for i, sigma in enumerate(scheduler.sigmas_np):
         print(f"  Level {i}: sigma = {sigma:.4f}")
 
@@ -231,15 +232,14 @@ def train_ncsn(
         shuffle=False
     )
 
-    # LR scheduler (cosine annealing)
-    total_steps = epochs * len(train_loader)
-    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=learning_rate * 0.01
+    # LR scheduler (gentle step decay every 3 epochs)
+    lr_scheduler = optim.lr_scheduler.StepLR(
+        optimizer, step_size=len(train_loader) * 3, gamma=0.5
     )
 
     print(f"\nTrain batches: {len(train_loader)}")
     print(f"Test batches: {len(test_loader)}")
-    print(f"LR scheduler: Cosine annealing from {learning_rate} to {learning_rate * 0.01}")
+    print(f"LR scheduler: StepLR - cut by 0.5 every 3 epochs")
 
     # Training loop
     print("\n" + "="*50)
@@ -292,7 +292,7 @@ def train_ncsn(
         # Generate samples every epoch
         if (epoch + 1) % 1 == 0:
             print("Generating samples...")
-            samples = ncsn.sample(num_samples=16, steps_per_level=100)
+            samples = ncsn.sample(num_samples=16, steps_per_level=500)
             wandb.log({
                 'generated_samples': [wandb.Image(img.cpu()) for img in samples]
             })
@@ -335,7 +335,7 @@ if __name__ == "__main__":
         num_scales=10,
         sigma_min=0.01,
         sigma_max=1.0,
-        schedule_type='cosine',  # 'geometric' or 'cosine'
+        schedule_type='geometric',  # 'geometric' or 'cosine' - geometric is better for NCSN
         device='cuda' if torch.cuda.is_available() else 'cpu',
         save_dir='../models',
         wandb_project='ncsn-fashion-mnist'

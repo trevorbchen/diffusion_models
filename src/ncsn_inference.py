@@ -18,8 +18,8 @@ def annealed_langevin_dynamics(
     scheduler,
     num_samples=16,
     image_size=(1, 28, 28),
-    steps_per_level=100,
-    step_size=0.00002,
+    steps_per_level=500,
+    step_size=None,
     temperature=1.0,
     device='cuda',
     seed=None,
@@ -33,8 +33,8 @@ def annealed_langevin_dynamics(
         scheduler: NCSNScheduler
         num_samples: Number of samples to generate
         image_size: (C, H, W)
-        steps_per_level: Number of Langevin steps per noise level
-        step_size: Fixed step size for Langevin dynamics (2e-5 default)
+        steps_per_level: Number of Langevin steps per noise level (500 default)
+        step_size: Step size for Langevin dynamics (if None, uses adaptive scaling)
         temperature: Noise temperature (1.0 = standard)
         device: Device
         seed: Random seed
@@ -59,7 +59,6 @@ def annealed_langevin_dynamics(
     print(f"\nAnnealed Langevin Dynamics:")
     print(f"  {num_levels} noise levels: {sigma_max:.3f} -> {sigma_min:.3f}")
     print(f"  {steps_per_level} steps per level")
-    print(f"  Step size: {step_size}")
     print(f"  Total steps: {num_levels * steps_per_level}")
 
     # Initialize from N(0, sigma_max^2)
@@ -72,14 +71,17 @@ def annealed_langevin_dynamics(
     for level in range(num_levels):
         sigma = scheduler.sigmas[level].item()
 
-        # Use fixed step size (more stable than adaptive scaling)
-        epsilon = step_size
+        # CRITICAL FIX: Adaptive step size that scales with sigma^2
+        if step_size is None:
+            epsilon = 0.1 * (sigma ** 2)  # Scale with sigma^2 - much more effective!
+        else:
+            epsilon = step_size
 
         level_idx = torch.full((num_samples,), level,
                                dtype=torch.long, device=device)
 
-        # Save snapshot at start of each level
-        if save_snapshots:
+        # Save snapshot at start of level (every other level to reduce memory)
+        if save_snapshots and level % 2 == 0:
             snap = x.detach().cpu().numpy()
             snap = (snap + 1) / 2
             snap = np.clip(snap, 0, 1)
@@ -91,16 +93,18 @@ def annealed_langevin_dynamics(
             with torch.no_grad():
                 score = model(x, level_idx)
 
-            # x <- x + epsilon*score + sqrt(2*epsilon)*z
-            # Last step of last level: no noise
-            if level == num_levels - 1 and step == steps_per_level - 1:
-                noise = 0
+            # Langevin update: x <- x + epsilon*score + sqrt(2*epsilon)*z
+            # Last steps of last level: gradually reduce noise
+            if level == num_levels - 1 and step >= steps_per_level - 10:
+                # Gradually reduce noise in final 10 steps
+                noise_scale = (steps_per_level - step) / 10.0
+                noise = torch.randn_like(x) * temperature * noise_scale
             else:
                 noise = torch.randn_like(x) * temperature
 
             x = x + epsilon * score + np.sqrt(2 * epsilon) * noise
 
-        print(f"  Level {level+1}/{num_levels}: sigma={sigma:.4f}, epsilon={epsilon:.2e}")
+        print(f"  Level {level+1}/{num_levels}: sigma={sigma:.4f}, epsilon={epsilon:.5f}")
 
     # Final snapshot
     if save_snapshots:
@@ -116,7 +120,7 @@ def annealed_langevin_dynamics(
 def visualize_annealed_sampling(
     model_path,
     num_samples=4,
-    steps_per_level=100,
+    steps_per_level=500,
     device='cuda',
     seed=42
 ):
@@ -143,6 +147,13 @@ def visualize_annealed_sampling(
 
     print(f"Loaded NCSN with {scheduler.num_scales} noise levels")
     print(f"Sigma range: [{scheduler.sigma_min}, {scheduler.sigma_max}]")
+
+    # Print noise schedule to verify direction
+    print(f"\nNoise schedule verification:")
+    for i in range(min(5, scheduler.num_scales)):
+        print(f"  Level {i}: sigma = {scheduler.sigmas[i].item():.4f}")
+    print(f"  ...")
+    print(f"  Level {scheduler.num_scales-1}: sigma = {scheduler.sigmas[-1].item():.4f}")
 
     # Generate samples
     samples, snapshots, info = annealed_langevin_dynamics(
@@ -185,7 +196,7 @@ def visualize_annealed_sampling(
 def generate_grid(
     model_path,
     num_samples=64,
-    steps_per_level=100,
+    steps_per_level=500,
     device='cuda',
     seed=42
 ):
@@ -250,13 +261,13 @@ if __name__ == "__main__":
 
     # Visualize sampling process
     visualize_annealed_sampling(model_path, num_samples=4,
-                                 steps_per_level=100, device=device)
+                                 steps_per_level=500, device=device)
 
     # Generate grid
     print("\n" + "="*60)
     print("Generating Sample Grid")
     print("="*60)
     generate_grid(model_path, num_samples=64,
-                  steps_per_level=100, device=device)
+                  steps_per_level=500, device=device)
 
     print("\nDone! NCSN uses annealed Langevin: high sigma -> low sigma.")
