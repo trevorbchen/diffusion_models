@@ -61,12 +61,12 @@ class NCSN:
         # Per-sample loss (MSE)
         loss_per_sample = ((predicted_score - target) ** 2).mean(dim=(1, 2, 3))
 
-        # Weight by sigma^2 to DOWN-weight small sigma levels
-        # At small sigma, target score = -noise/sigma becomes huge
-        # Weighting by sigma^2 compensates: sigma^2 * (1/sigma^2) = 1
-        weights = sigma ** 2
+        # UNIFORM weighting - simplest and most stable
+        # sigma^2 weighting compensates for 1/sigma^2 in target, but uniform is cleaner
+        # With importance sampling of low-sigma levels, we don't need fancy weighting
+        weights = torch.ones_like(sigma)
 
-        # Weighted mean
+        # Weighted mean (effectively just .mean() with uniform weights)
         loss = (weights * loss_per_sample).mean()
 
         return loss
@@ -132,11 +132,10 @@ class NCSN:
                 score = self.model(x, level_idx)
 
                 # Langevin update
-                # Last steps of last level: gradually reduce noise
-                if level == self.scheduler.num_scales - 1 and step >= steps_per_level - 10:
-                    # Gradually reduce noise in final 10 steps
-                    noise_scale = (steps_per_level - step) / 10.0
-                    noise = torch.randn_like(x) * temperature * noise_scale
+                # Last 3 levels: pure gradient ascent (no noise injection)
+                # This prevents corrupting nearly-clean samples at low sigma
+                if level >= self.scheduler.num_scales - 3:
+                    noise = torch.zeros_like(x)
                 else:
                     noise = torch.randn_like(x) * temperature
 

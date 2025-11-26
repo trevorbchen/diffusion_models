@@ -40,6 +40,7 @@ class NCSNDataset(Dataset):
             dict with:
                 - 'image': Clean image tensor (1, 28, 28) in [-1, 1]
                 - 'level_idx': Random noise level index (0 to num_scales-1)
+                                with importance sampling favoring low-sigma levels
         """
         # Get image
         image = self.dataset[idx]["image"]
@@ -53,8 +54,15 @@ class NCSNDataset(Dataset):
         if self.augment and torch.rand(1).item() > 0.5:
             image_tensor = torch.flip(image_tensor, dims=[2])
 
-        # Sample random noise level (uniform over all levels)
-        level_idx = torch.randint(0, self.num_scales, (1,)).item()
+        # Importance sampling: oversample low-sigma levels (second half)
+        # 50% of time sample from low-sigma levels (harder to learn)
+        # 50% of time sample uniformly (coverage of all levels)
+        if torch.rand(1).item() < 0.5:
+            # Sample from second half (lower sigma levels)
+            level_idx = torch.randint(self.num_scales // 2, self.num_scales, (1,)).item()
+        else:
+            # Sample uniformly across all levels
+            level_idx = torch.randint(0, self.num_scales, (1,)).item()
 
         return {
             'image': image_tensor,

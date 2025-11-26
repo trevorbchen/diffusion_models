@@ -88,23 +88,28 @@ def annealed_langevin_dynamics(
             snapshots.append(snap)
             snapshot_info.append((level, 0, sigma))
 
+        # Diagnostic: check score quality every few levels
+        if level % 3 == 0 or level >= num_levels - 3:
+            with torch.no_grad():
+                score_sample = model(x, level_idx)
+                score_norm = score_sample.norm().item()
+                x_min, x_max = x.min().item(), x.max().item()
+            print(f"  Level {level}: sigma={sigma:.4f}, epsilon={epsilon:.5f}, score_norm={score_norm:.2f}, x_range=[{x_min:.2f}, {x_max:.2f}]")
+
         # Langevin dynamics at this noise level
         for step in range(steps_per_level):
             with torch.no_grad():
                 score = model(x, level_idx)
 
             # Langevin update: x <- x + epsilon*score + sqrt(2*epsilon)*z
-            # Last steps of last level: gradually reduce noise
-            if level == num_levels - 1 and step >= steps_per_level - 10:
-                # Gradually reduce noise in final 10 steps
-                noise_scale = (steps_per_level - step) / 10.0
-                noise = torch.randn_like(x) * temperature * noise_scale
+            # Last 3 levels: pure gradient ascent (no noise injection)
+            # This prevents corrupting nearly-clean samples at low sigma
+            if level >= num_levels - 3:
+                noise = torch.zeros_like(x)
             else:
                 noise = torch.randn_like(x) * temperature
 
             x = x + epsilon * score + np.sqrt(2 * epsilon) * noise
-
-        print(f"  Level {level+1}/{num_levels}: sigma={sigma:.4f}, epsilon={epsilon:.5f}")
 
     # Final snapshot
     if save_snapshots:
